@@ -354,7 +354,79 @@ SEPARATOR_RE = re.compile(r"^[=\-_\u2500\u2014]{6,}\s*$")
 STARS_RE = re.compile(r"^(\*\s*){2,}$|^\*{1,3}\s*$")
 UNI_RE = re.compile(r"(?i)^uni[\s\-]?hack\s*:?\s*$")
 FUNCTION_RE = re.compile(r"(?i)^function\s+(\d+)\s*$")
-CHAPTER_RE = re.compile(r"(?i)^chapter\s+(\d+)\s*$")
+
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50}
+
+
+def _roman_to_int(s: str) -> int:
+    vals = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+    s = s.lower()
+    if not s or any(c not in vals for c in s):
+        return 0
+    total, prev = 0, 0
+    for c in reversed(s):
+        v = vals[c]
+        total, prev = (total - v, v) if v < prev else (total + v, v)
+    # Guard against non-canonical strings like "ID" or "CIVIC".
+    if total <= 0 or total > 60:
+        return 0
+    return total
+
+
+def _words_to_int(s: str) -> int:
+    s = s.strip().lower().replace("-", " ")
+    if s.isdigit():
+        return int(s)
+    if s in NUMBER_WORDS:
+        return NUMBER_WORDS[s]
+    parts = s.split()
+    if len(parts) == 2 and parts[0] in _TENS and parts[1] in NUMBER_WORDS:
+        return _TENS[parts[0]] + NUMBER_WORDS[parts[1]]
+    return 0
+
+
+def parse_chapter_heading(text: str) -> tuple[int, str] | None:
+    """Parse 'Chapter N' / 'Chapter One' with optional ': subtitle'.
+
+    Returns (number, same_line_subtitle) or None. Number is 0 when the
+    heading has no recognisable number (caller falls back to sequence).
+    """
+    m = re.match(r"(?i)^chapter\s+(.+?)\s*$", text.strip())
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    # Split off a same-line subtitle: "One: Agents and Daemons".
+    num_part, subtitle = rest, ""
+    for sep in (":", "\u2014", "--"):
+        if sep in rest:
+            head, tail = rest.split(sep, 1)
+            if tail.strip():
+                num_part, subtitle = head.strip(), tail.strip()
+                break
+    n = _words_to_int(num_part)
+    if not n:
+        n = _roman_to_int(num_part)
+    if not n and num_part:
+        # Unnumbered heading like "Chapter One..." that failed to parse:
+        # still a chapter, number resolved by sequence later.
+        pass
+    elif not n and not num_part:
+        return None
+    # Reject false positives: the "number" part must be short. A long
+    # sentence starting with the word Chapter is body text, not a heading.
+    if len(num_part) > 30:
+        return None
+    return n, subtitle
+
+
+CHAPTER_RE = re.compile(r"(?i)^chapter\b")
 VOLUME_TITLE_RE = re.compile(r"(?i)^uni[\s\-]?hack\s+volume\s+[ivx\d]+.*")
 
 
@@ -402,7 +474,8 @@ def split_chapters(paras: list[Para], styles: dict[str, ParaStyle]) -> tuple[lis
             break
 
     # Find chapter-start indices.
-    starts: list[tuple[int, str, str]] = []  # (para_index, kind, number)
+    starts: list[tuple[int, str, int, str]] = []  # (para_index, kind, number, same_line_subtitle)
+    seq = 0
     i = 0
     n = len(paras)
     while i < n:
@@ -414,7 +487,7 @@ def split_chapters(paras: list[Para], styles: dict[str, ParaStyle]) -> tuple[lis
                 j += 1
             if j < n and FUNCTION_RE.match(paras[j].text.strip()):
                 num = FUNCTION_RE.match(paras[j].text.strip()).group(1)  # type: ignore
-                starts.append((i, "function", num))
+                starts.append((i, "function", int(num), ""))
                 i = j + 1
                 continue
         elif FUNCTION_RE.match(t):
@@ -423,14 +496,17 @@ def split_chapters(paras: list[Para], styles: dict[str, ParaStyle]) -> tuple[lis
             # Avoid false positives: require nearby separator or Uni-Hack context.
             prev_text = " ".join(p.text for p in paras[max(0, i - 4):i])
             if "Uni-Hack" in prev_text or _is_separator(paras[i - 1].text) if i > 0 else True:
-                starts.append((i, "function", num))
+                starts.append((i, "function", int(num), ""))
                 i += 1
                 continue
-        elif CHAPTER_RE.match(t):
-            num = CHAPTER_RE.match(t).group(1)  # type: ignore
-            starts.append((i, "chapter", num))
-            i += 1
-            continue
+        elif len(t) <= 140:
+            parsed = parse_chapter_heading(t)
+            if parsed is not None:
+                num, inline_sub = parsed
+                seq += 1
+                starts.append((i, "chapter", num or seq, inline_sub))
+                i += 1
+                continue
         i += 1
 
     chapters: list[Chapter] = []
@@ -492,7 +568,7 @@ def split_chapters(paras: list[Para], styles: dict[str, ParaStyle]) -> tuple[lis
     # If opening is only a title page (< 4 paras of real text), still keep it as Opening.
     has_opening = any(p.text.strip() for p in opening_paras)
     # Determine chapter boundaries.
-    for si, (sidx, kind, num) in enumerate(starts):
+    for si, (sidx, kind, num, inline_sub) in enumerate(starts):
         end = starts[si + 1][0] if si + 1 < len(starts) else n
         # Chapter marker spans sidx..marker_end (Uni-Hack line + Function line).
         marker_end = sidx + 1
@@ -510,6 +586,8 @@ def split_chapters(paras: list[Para], styles: dict[str, ParaStyle]) -> tuple[lis
             marker_end = sidx + 1
             label = f"Chapter {int(num)}"
         subtitle, body_start = collect_subtitle(marker_end, kind)
+        if not subtitle:
+            subtitle = inline_sub
         # Special case uh1 Function 13: author aside lines are body, not subtitle (handled: not blue).
         body_paras = [p for p in paras[body_start:end]]
         # Strip leading blanks/separators left over.
@@ -581,7 +659,9 @@ def excerpt(paras: list[Para], limit: int = 220) -> str:
         # Skip meta one-liners and the legal disclaimer.
         if t.startswith("Disclaimer:"):
             continue
-        if CHAPTER_RE.match(t) or FUNCTION_RE.match(t) or UNI_RE.match(t):
+        if FUNCTION_RE.match(t) or UNI_RE.match(t):
+            continue
+        if len(t) <= 140 and parse_chapter_heading(t) is not None:
             continue
         words.extend(t.split())
         if len(" ".join(words)) >= limit:
@@ -620,23 +700,41 @@ SITE_TAGLINE = "A quiet shelf for long stories"
 
 
 def discover_sources() -> list[tuple[str, Path]]:
-    """Return [(series_id, odt_path)] discovered on disk."""
+    """Return [(series_id, odt_path)] discovered on disk.
+
+    Only OpenDocument (.odt) sources are built. Anything else (e.g. Word
+    .doc) is reported so the author knows to re-save it as ODF.
+    """
     found: list[tuple[str, Path]] = []
+    skipped: list[Path] = []
+
+    def harvest(series_name: str, directory: Path) -> None:
+        for item in sorted(directory.iterdir()):
+            if item.is_dir():
+                continue
+            if item.suffix.lower() == ".odt":
+                found.append((series_name, item))
+            elif item.name.startswith((".", "~")) or item.suffix.lower() == ".tmp":
+                continue
+            else:
+                skipped.append(item)
+
     if STORIES_ROOT.exists():
         for series_dir in sorted(p for p in STORIES_ROOT.iterdir() if p.is_dir()):
-            for odt in sorted(series_dir.glob("*.odt")):
-                found.append((series_dir.name, odt))
+            harvest(series_dir.name, series_dir)
         # Also allow loose .odt directly under stories/ as its own series.
-        for odt in sorted(STORIES_ROOT.glob("*.odt")):
+        for odt in sorted(STORIES_ROOT.glob("*.odt")) + sorted(STORIES_ROOT.glob("*.ODT")):
             found.append(("miscellany", odt))
     if not found and LEGACY_FALLBACK:
         for child in sorted(ROOT.iterdir()):
             if child.is_dir() and not child.name.startswith(".") and child.name not in (
                 "site", "assets", "tools", "node_modules", "__pycache__",
             ):
-                odts = sorted(child.glob("*.odt"))
-                for odt in odts:
+                for odt in sorted(child.glob("*.odt")) + sorted(child.glob("*.ODT")):
                     found.append((child.name, odt))
+    for path in skipped:
+        print(f"WARNING: skipping {path}: not an .odt file "
+              f"(save it as ODF to publish it)", file=sys.stderr)
     return found
 
 
@@ -901,6 +999,7 @@ def story_page(s: Series, st: Story, prev_story: Story | None, next_story: Story
             f'<a class="right" href="../{next_story.slug}/index.html">{html.escape(next_story.title)} &rarr;</a>' if next_story else "",
         ]) + "</nav>"
     first = st.chapters[0].slug + ".html" if st.chapters else "#"
+    begin_label = "Begin reading" if len(st.chapters) <= 1 else "Begin at the opening"
     body = f"""
 <div class="wrap narrow">
   {breadcrumbs([("Library", "../../index.html"), (s.title, "../index.html"), (st.title, "")])}
@@ -908,7 +1007,7 @@ def story_page(s: Series, st: Story, prev_story: Story | None, next_story: Story
     <p class="kicker">Series: {html.escape(s.title)} &middot; Story {st.order}</p>
     <h1>{html.escape(st.title)}</h1>
     <p class="lede">{len(st.chapters)} chapters &middot; {fmt_words(st.words)} words &middot; about {reading_minutes(st.words)} minutes by lamplight.</p>
-    <div class="hero-actions"><a class="btn solid" href="{first}">Begin at the opening</a></div>
+    <div class="hero-actions"><a class="btn solid" href="{first}">{begin_label}</a></div>
   </header>
   <ol class="chapter-index tall">{''.join(ch_items)}</ol>
   {sib_nav}

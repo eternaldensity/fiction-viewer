@@ -17,9 +17,14 @@ site/                           <- generated output (deployed to Pages)
 - **Stories are documents.** Every `*.odt` in a series folder becomes a story,
   ordered by its filename prefix (`uh1 Unlocking.odt`, `uh2 unmasking.odt`).
 - **Chapters are headings.** Lines reading `Function N` (optionally preceded by
-  `Uni-Hack`) or `Chapter N`, with an optional short subtitle line underneath,
-  each become a chapter page. Everything before the first one becomes
-  *Opening*. Lines of only `*` or `=` become quiet scene-break ornaments.
+  `Uni-Hack`) or `Chapter N` — with `N` as digits, words (`One`), or Roman
+  numerals — each become a chapter page, with an optional subtitle either on
+  the same line after a colon (`Chapter One: Agents and Daemons`) or on the
+  next line underneath. Everything before the first one becomes *Opening*.
+  Lines of only `*` or `=` that do *not* sit above a chapter title render as
+  quiet scene-break ornaments.
+- Only `.odt` (ODF) documents are built; anything else in `stories/` is
+  skipped with a warning naming the file, so save Word docs as ODF first.
 - **Formatting is preserved.** Source colours (the blue headings, red
   disclaimer, grey asides), relative sizes (9/11/12/14pt), bold/italic,
   centring and indents are carried into the page with theme-aware CSS. Font
