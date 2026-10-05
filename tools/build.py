@@ -410,6 +410,7 @@ def parse_chapter_heading(text: str) -> tuple[int, str] | None:
             if tail.strip():
                 num_part, subtitle = head.strip(), tail.strip()
                 break
+    num_part = num_part.strip().rstrip(".").strip()
     n = _words_to_int(num_part)
     if not n:
         n = _roman_to_int(num_part)
